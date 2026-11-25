@@ -11,13 +11,14 @@ const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 3000);
 
-function getAiClient(): GoogleGenAI {
+function getAiClient(apiVersion?: string): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error('GEMINI_API_KEY is not configured in environment secrets.');
   }
   return new GoogleGenAI({
     apiKey,
+    ...(apiVersion ? { apiVersion } : {}),
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
@@ -575,49 +576,49 @@ ${beats
         Close: 'Bright, happy, relieved English storytelling voice, warm smile in tone',
       };
 
-      const ai = getAiClient();
-      const response = await callWithRetry(() =>
-        ai.models.generateContent({
+      const aiBeta = getAiClient('v1beta');
+      const interaction = await callWithRetry(() =>
+        aiBeta.interactions.create({
           model: 'gemini-3.8-flash-lite-tts',
-          contents: [
+          input: [
             {
-              role: 'user',
-              parts: [
+              type: 'text',
+              text: cleanText,
+              annotations: [
                 {
-                  text: cleanText,
-                  speechMetadata: {
-                    style:
-                      styleToneByRole[String(role)] ||
-                      'Clear, warm, natural everyday English for learners',
-                  },
+                  type: 'speech_metadata',
+                  style:
+                    styleToneByRole[String(role)] ||
+                    'Clear, warm, natural everyday English for learners',
                 },
               ],
             },
           ],
-          config: {
-            responseModalities: ['AUDIO'],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: selectedVoice },
+          response_format: { type: 'audio' },
+          generation_config: {
+            speech_config: [
+              {
+                language: 'en-US',
+                voice: selectedVoice,
               },
-            },
+            ],
           },
         })
       );
 
-      const inlineData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData;
-      if (!inlineData?.data) {
+      const audio = interaction.output_audio;
+      if (!audio?.data) {
         res.status(502).json({ error: 'Speech model returned no audio data.' });
         return;
       }
 
-      const wavBuffer = Buffer.from(inlineData.data, 'base64');
+      const wavBuffer = Buffer.from(audio.data, 'base64');
       // Unary TTS returns a 24kHz, 16-bit mono WAV file (48,000 bytes/sec after 44-byte header)
       const pcmBytes = Math.max(0, wavBuffer.length - 44);
       const durationSec = Number((pcmBytes / 48000).toFixed(2)) || 5.0;
 
       res.json({
-        audioDataUrl: `data:${inlineData.mimeType || 'audio/wav'};base64,${inlineData.data}`,
+        audioDataUrl: `data:${audio.mime_type || 'audio/wav'};base64,${audio.data}`,
         durationSec,
       });
     } catch (err) {
