@@ -627,6 +627,23 @@ ${beats
     }
   });
 
+  // Ensure unmatched /api/* requests always return JSON
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'API endpoint not found.' });
+  });
+
+  app.use(
+    (
+      err: unknown,
+      _req: express.Request,
+      res: express.Response,
+      _next: express.NextFunction
+    ) => {
+      const formatted = formatGeminiError(err);
+      res.status(formatted.status).json({ error: formatted.message });
+    }
+  );
+
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({

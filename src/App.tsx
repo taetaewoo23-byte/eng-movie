@@ -21,6 +21,63 @@ import { FinalStep } from './components/FinalStep';
 
 const STEP_ORDER: AppStep[] = ['expressions', 'scene', 'storyboard', 'video', 'final'];
 
+async function postJsonWithRetry<T>(
+  url: string,
+  payload: unknown,
+  retries = 2
+): Promise<T> {
+  let lastErr: Error | null = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const rawText = await res.text();
+      let parsed: Record<string, unknown> | null = null;
+      try {
+        parsed = rawText ? (JSON.parse(rawText) as Record<string, unknown>) : {};
+      } catch {
+        parsed = null;
+      }
+
+      if (!parsed) {
+        // Transient proxy/HTML response (e.g. "The page could not be found" during server restart)
+        if (attempt < retries) {
+          await new Promise((r) => setTimeout(r, 900 * (attempt + 1)));
+          continue;
+        }
+        throw new Error(
+          `Server returned an unexpected response (${res.status}). Please try again in a moment.`
+        );
+      }
+
+      if (!res.ok) {
+        const msg =
+          typeof parsed.error === 'string'
+            ? parsed.error
+            : `Request failed (${res.status}).`;
+        if (res.status >= 502 && attempt < retries) {
+          await new Promise((r) => setTimeout(r, 900 * (attempt + 1)));
+          continue;
+        }
+        throw new Error(msg);
+      }
+
+      return parsed as T;
+    } catch (err) {
+      lastErr = err instanceof Error ? err : new Error('Network request failed.');
+      if (attempt < retries && !lastErr.message.includes('API key')) {
+        await new Promise((r) => setTimeout(r, 900 * (attempt + 1)));
+        continue;
+      }
+      throw lastErr;
+    }
+  }
+  throw lastErr || new Error('Request failed.');
+}
+
 export default function App() {
   const [currentStep, setCurrentStep] = useState<AppStep>('expressions');
   const [maxReachedStep, setMaxReachedStep] = useState<AppStep>('expressions');
@@ -41,6 +98,7 @@ export default function App() {
   }));
 
   const [beats, setBeats] = useState<Beat[]>([]);
+  const [beatsEdited, setBeatsEdited] = useState(false);
   const [beatAudios, setBeatAudios] = useState<BeatAudio[]>([]);
 
   const [isGeneratingStoryboard, setIsGeneratingStoryboard] = useState(false);
@@ -89,23 +147,16 @@ export default function App() {
     setIsGeneratingStoryboard(true);
     setErrorMsg(null);
     try {
-      const res = await fetch('/api/storyboard', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          expressions: expressions.filter((e) => e.phrase.trim().length > 0),
-          place: sceneConfig.place,
-          characters: sceneConfig.characters,
-          situation: sceneConfig.situation,
-          style: sceneConfig.style,
-          characterBible: sceneConfig.characterBible,
-        }),
+      const data = await postJsonWithRetry<{ beats: Beat[] }>('/api/storyboard', {
+        expressions: expressions.filter((e) => e.phrase.trim().length > 0),
+        place: sceneConfig.place,
+        characters: sceneConfig.characters,
+        situation: sceneConfig.situation,
+        style: sceneConfig.style,
+        characterBible: sceneConfig.characterBible,
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Could not write storyboard.');
-      }
       setBeats(data.beats);
+      setBeatsEdited(false);
       setBeatAudios([]);
       advanceStep('storyboard');
     } catch (err) {
@@ -116,6 +167,7 @@ export default function App() {
   };
 
   const handleUpdateBeat = (index: number, patch: Partial<Beat>) => {
+    setBeatsEdited(true);
     setBeats((prev) =>
       prev.map((b) => (b.index === index ? { ...b, ...patch } : b))
     );
@@ -125,10 +177,9 @@ export default function App() {
     setRegeneratingBeatIndex(index);
     setErrorMsg(null);
     try {
-      const res = await fetch('/api/storyboard/regenerate-beat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      const data = await postJsonWithRetry<{ beat: Beat }>(
+        '/api/storyboard/regenerate-beat',
+        {
           beatIndex: index,
           beats,
           expressions: expressions.filter((e) => e.phrase.trim().length > 0),
@@ -137,12 +188,8 @@ export default function App() {
           situation: sceneConfig.situation,
           style: sceneConfig.style,
           characterBible: sceneConfig.characterBible,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Could not regenerate beat.');
-      }
+        }
+      );
       setBeats((prev) =>
         prev.map((b) => (b.index === index ? data.beat : b))
       );
@@ -156,57 +203,49 @@ export default function App() {
   const handleCreateVideo = async () => {
     setIsPreparingVideo(true);
     setErrorMsg(null);
-    setVideoPrepStatus('Syncing animation choreography & natural English voice...');
     try {
-      // 1. Refresh choreography so any manual edits to beats match the animation
-      const choreoPromise = fetch('/api/choreography', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          beats,
-          place: sceneConfig.place,
-          characters: sceneConfig.characters,
-          style: sceneConfig.style,
-        }),
-      }).then(async (r) => {
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || 'Choreography error');
-        return d.choreographies;
-      });
-
-      // 2. Generate natural English TTS WAV audio for all 4 beats in parallel
-      const ttsPromises = beats.map(async (beat) => {
-        const res = await fetch('/api/tts', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            text: beat.englishLines,
-            voiceName: sceneConfig.voiceName,
-            role: beat.role,
-          }),
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data.error || `Voice generation failed for beat ${beat.index + 1}`);
-        }
-        return {
-          beatIndex: beat.index,
-          audioDataUrl: data.audioDataUrl as string,
-          durationSec: data.durationSec as number,
-        };
-      });
-
-      const [choreographies, audios] = await Promise.all([
-        choreoPromise,
-        Promise.all(ttsPromises),
-      ]);
-
-      setBeats((prev) =>
-        prev.map((b, i) => ({
+      let updatedBeats = beats;
+      if (beatsEdited) {
+        setVideoPrepStatus('Updating animation choreography for your edits...');
+        const choreoData = await postJsonWithRetry<{ choreographies: Beat['choreography'][] }>(
+          '/api/choreography',
+          {
+            beats,
+            place: sceneConfig.place,
+            characters: sceneConfig.characters,
+            style: sceneConfig.style,
+          }
+        );
+        updatedBeats = beats.map((b, i) => ({
           ...b,
-          choreography: choreographies[i] || b.choreography,
-        }))
-      );
+          choreography: choreoData.choreographies[i] || b.choreography,
+        }));
+        setBeats(updatedBeats);
+        setBeatsEdited(false);
+      }
+
+      // Generate natural English TTS WAV audio beat by beat with live status
+      const audios: BeatAudio[] = [];
+      for (let i = 0; i < updatedBeats.length; i++) {
+        const beat = updatedBeats[i];
+        setVideoPrepStatus(
+          `Generating natural English voice (Beat ${i + 1} of ${updatedBeats.length})...`
+        );
+        const ttsData = await postJsonWithRetry<{
+          audioDataUrl: string;
+          durationSec: number;
+        }>('/api/tts', {
+          text: beat.englishLines,
+          voiceName: sceneConfig.voiceName,
+          role: beat.role,
+        });
+        audios.push({
+          beatIndex: beat.index,
+          audioDataUrl: ttsData.audioDataUrl,
+          durationSec: ttsData.durationSec,
+        });
+      }
+
       setBeatAudios(audios);
       advanceStep('video');
     } catch (err) {
